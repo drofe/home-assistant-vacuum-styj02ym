@@ -7,35 +7,25 @@ from miio import DeviceException, RoborockVacuum  # pylint: disable=import-error
 import voluptuous as vol
 
 from homeassistant.components.vacuum import (
-    ATTR_CLEANED_AREA,
     DOMAIN,
     PLATFORM_SCHEMA,
-    STATE_CLEANING,
-    STATE_DOCKED,
-    STATE_ERROR,
-    STATE_IDLE,
-    STATE_PAUSED,
-    STATE_RETURNING,
-    SUPPORT_BATTERY,
-    SUPPORT_FAN_SPEED,
-    SUPPORT_LOCATE,
-    SUPPORT_PAUSE,
-    SUPPORT_RETURN_HOME,
-    SUPPORT_SEND_COMMAND,
-    SUPPORT_START,
-    SUPPORT_STATE,
-    SUPPORT_STOP,
     StateVacuumEntity,
+    VacuumActivity,
+    VacuumEntityFeature,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     CONF_HOST,
     CONF_NAME,
     CONF_TOKEN,
-    STATE_OFF,
-    STATE_ON,
 )
 import homeassistant.helpers.config_validation as cv
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.const import PERCENTAGE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,27 +86,26 @@ FAN_SPEEDS = {"Silent": 0, "Standard": 1, "Medium": 2, "Turbo": 3}
 
 
 SUPPORT_XIAOMI = (
-    SUPPORT_STATE
-    | SUPPORT_PAUSE
-    | SUPPORT_STOP
-    | SUPPORT_RETURN_HOME
-    | SUPPORT_FAN_SPEED
-    | SUPPORT_LOCATE
-    | SUPPORT_SEND_COMMAND
-    | SUPPORT_BATTERY
-    | SUPPORT_START
+    VacuumEntityFeature.STATE
+    | VacuumEntityFeature.PAUSE
+    | VacuumEntityFeature.STOP
+    | VacuumEntityFeature.RETURN_HOME
+    | VacuumEntityFeature.FAN_SPEED
+    | VacuumEntityFeature.LOCATE
+    | VacuumEntityFeature.SEND_COMMAND
+    | VacuumEntityFeature.START
 )
 
 
 STATE_CODE_TO_STATE = {
-    0: STATE_IDLE,
-    1: STATE_IDLE,
-    2: STATE_PAUSED,
-    3: STATE_CLEANING,
-    4: STATE_RETURNING,
-    5: STATE_DOCKED,
-    6: STATE_CLEANING,  # Vacuum & Mop
-    7: STATE_CLEANING   # Mop only
+    0: VacuumActivity.IDLE,
+    1: VacuumActivity.IDLE,
+    2: VacuumActivity.PAUSED,
+    3: VacuumActivity.CLEANING,
+    4: VacuumActivity.RETURNING,
+    5: VacuumActivity.DOCKED,
+    6: VacuumActivity.CLEANING,  # Vacuum & Mop
+    7: VacuumActivity.CLEANING   # Mop only
 }
 
 ALL_PROPS = ["run_state", "mode", "err_state", "battary_life", "box_type", "mop_type", "s_time",
@@ -138,8 +127,9 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
   mirobo = MiroboVacuum2(name, vacuum)
   hass.data[DATA_KEY][host] = mirobo
+  battery_sensor = MiroboVacuumBatterySensor(name, mirobo)
 
-  async_add_entities([mirobo], update_before_add=True)
+  async_add_entities([mirobo, battery_sensor], update_before_add=True)
 
   async def async_service_handler(service):
     """Map services to methods on MiroboVacuum."""
@@ -195,7 +185,20 @@ class MiroboVacuum2(StateVacuumEntity):
     return self._name
 
   @property
-  def state(self):
+  def device_info(self):
+    return {
+        "identifiers": {(DOMAIN, self._vacuum.ip)},
+        "name": self._name,
+        "manufacturer": "Xiaomi",
+        "model": "Roborock STYJ02YM",
+    }
+
+  @property
+  def unique_id(self):
+    return f"{self._vacuum.ip}_vacuum"
+
+  @property
+  def activity(self):
     """Return the status of the vacuum cleaner."""
     if self.vacuum_state is not None:
       # The vacuum reverts back to an idle state after erroring out.
@@ -209,12 +212,6 @@ class MiroboVacuum2(StateVacuumEntity):
             self.vacuum_state['run_state'],
         )
         return None
-
-  @property
-  def battery_level(self):
-    """Return the battery level of the vacuum cleaner."""
-    if self.vacuum_state is not None:
-      return self.vacuum_state['battary_life']
 
   @property
   def fan_speed(self):
@@ -231,7 +228,7 @@ class MiroboVacuum2(StateVacuumEntity):
     return list(sorted(FAN_SPEEDS.keys(), key=lambda s: FAN_SPEEDS[s]))
 
   @property
-  def device_state_attributes(self):
+  def extra_state_attributes(self):
     """Return the specific state attributes of this vacuum cleaner."""
     attrs = {}
     if self.vacuum_state is not None:
@@ -370,7 +367,7 @@ class MiroboVacuum2(StateVacuumEntity):
       self.vacuum_state = dict(zip(ALL_PROPS, state))
 
       self._available = True
-      
+
       # Automatically set mop based on mop_type
       is_mop = bool(self.vacuum_state['is_mop'])
       has_mop = bool(self.vacuum_state['mop_type'])
@@ -411,3 +408,30 @@ class MiroboVacuum2(StateVacuumEntity):
     self._last_clean_point = point
     await self._try_command("Unable to clean point: %s", self._vacuum.raw_command, 'set_uploadmap', [0]) \
         and await self._try_command("Unable to clean point: %s", self._vacuum.raw_command, 'set_pointclean', [1, x, y])
+
+class MiroboVacuumBatterySensor(SensorEntity):
+  """Battery sensor for Xiaomi Vacuum, as a separate entity."""
+
+  _attr_device_class = SensorDeviceClass.BATTERY
+  _attr_state_class = SensorStateClass.MEASUREMENT
+  _attr_native_unit_of_measurement = PERCENTAGE
+
+  def __init__(self, name, vacuum_entity):
+    self._vacuum_entity = vacuum_entity
+    self._attr_name = f"{name} Battery"
+    self._attr_unique_id = f"{vacuum_entity._vacuum.ip}_battery"
+
+  @property
+  def device_info(self):
+    return self._vacuum_entity.device_info
+
+  @property
+  def native_value(self):
+    state = self._vacuum_entity.vacuum_state
+    if state is not None:
+        return state.get("battary_life")
+    return None
+
+  @property
+  def available(self):
+    return self._vacuum_entity.available
